@@ -8,6 +8,10 @@ use core::cmp::Ordering;
 use core::convert::TryInto;
 use core::fmt::Debug;
 use core::mem::size_of;
+use core::num::{
+    NonZeroI8, NonZeroI16, NonZeroI32, NonZeroI64, NonZeroI128, NonZeroU8, NonZeroU16, NonZeroU32,
+    NonZeroU64, NonZeroU128,
+};
 #[cfg(feature = "chrono_v0_4")]
 mod chrono_v0_4;
 #[cfg(feature = "uuid")]
@@ -159,6 +163,21 @@ pub trait Value: Debug {
     type AsBytes<'a>: AsRef<[u8]> + 'a
     where
         Self: 'a;
+
+    /// A byte string that [`as_bytes()`](Self::as_bytes) never returns, if the type declares one.
+    ///
+    /// `Option<Self>` encodes `None` as it, in place of the tag byte it otherwise prefixes to
+    /// every encoding, so `Option<Self>` costs no more space than `Self`. Declaring one is
+    /// optional, and the default is `None`.
+    ///
+    /// A fixed width type's niche must be exactly [`fixed_width()`](Self::fixed_width) bytes
+    /// long. A variable width type's niche may be any length, including empty.
+    ///
+    /// Implementations must ensure that `as_bytes()` never returns the niche, for any value:
+    /// `Option<Self>` would decode that value as `None`. Declaring a niche for a type that
+    /// already has tables, or changing it, changes how `Option<Self>` is encoded without changing
+    /// its `type_name()`, so existing tables holding `Option<Self>` would no longer be readable.
+    const NICHE: Option<&'static [u8]> = None;
 
     /// Width of a fixed type, or None for variable width
     fn fixed_width() -> Option<usize>;
@@ -346,13 +365,25 @@ impl<T: Value> Value for Option<T> {
         Self: 'a;
 
     fn fixed_width() -> Option<usize> {
-        T::fixed_width().map(|x| x + 1)
+        if T::NICHE.is_some() {
+            // `None` is encoded as the niche, so there is no tag to make room for
+            T::fixed_width()
+        } else {
+            T::fixed_width().map(|x| x + 1)
+        }
     }
 
     fn from_bytes<'a>(data: &'a [u8]) -> Option<T::SelfType<'a>>
     where
         Self: 'a,
     {
+        if let Some(niche) = T::NICHE {
+            return if data == niche {
+                None
+            } else {
+                Some(T::from_bytes(data))
+            };
+        }
         match data[0] {
             0 => None,
             1 => Some(T::from_bytes(&data[1..])),
@@ -364,6 +395,22 @@ impl<T: Value> Value for Option<T> {
     where
         Self: 'b,
     {
+        if let Some(niche) = T::NICHE {
+            return if let Some(x) = value {
+                let encoded = T::as_bytes(x);
+                debug_assert!(
+                    encoded.as_ref() != niche,
+                    "a value encodes to the niche of its type"
+                );
+                encoded.as_ref().to_vec()
+            } else {
+                debug_assert!(
+                    T::fixed_width().is_none_or(|width| width == niche.len()),
+                    "the niche of a fixed width type is not that wide"
+                );
+                niche.to_vec()
+            };
+        }
         let mut result = vec![0];
         if let Some(x) = value {
             result[0] = 1;
@@ -384,6 +431,15 @@ impl<T: Value> Value for Option<T> {
 impl<T: Key> Key for Option<T> {
     #[allow(clippy::collapsible_else_if)]
     fn compare(data1: &[u8], data2: &[u8]) -> Ordering {
+        if let Some(niche) = T::NICHE {
+            // `None` sorts below every `Some`, as it does when encoded with a tag
+            return match (data1 == niche, data2 == niche) {
+                (true, true) => Ordering::Equal,
+                (true, false) => Ordering::Less,
+                (false, true) => Ordering::Greater,
+                (false, false) => T::compare(data1, data2),
+            };
+        }
         if data1[0] == 0 {
             if data2[0] == 0 {
                 Ordering::Equal
@@ -405,6 +461,17 @@ impl<T: Key> Key for Option<T> {
         if T::fixed_width().is_some() {
             return Cow::Borrowed(left);
         }
+        if let Some(niche) = T::NICHE {
+            // A `None` on the left keeps its encoding, as it does when encoded with a tag
+            if left == niche {
+                return Cow::Borrowed(left);
+            }
+            // Both are `Some`, encoded exactly as `T`, so they separate as `T` does. The result
+            // is an encoding of `T`, which the niche never is.
+            let separator = T::separator(left, right);
+            debug_assert!(separator.as_ref() != niche);
+            return separator;
+        }
         // `None` sorts below every `Some` and encodes as the tag alone, so nothing is shorter
         if left[0] == 0 {
             return Cow::Borrowed(left);
@@ -424,6 +491,9 @@ impl<T: Key> Key for Option<T> {
 
     // `None` sorts below every `Some`
     fn min_encoded_key() -> Option<Cow<'static, [u8]>> {
+        if let Some(niche) = T::NICHE {
+            return Some(Cow::Borrowed(niche));
+        }
         Some(match T::fixed_width() {
             // A fixed width `T` pads the tag out to the width of a `Some`
             Some(width) => Cow::Owned(vec![0; width + 1]),
@@ -916,6 +986,65 @@ le_impl!(i128);
 le_value!(f32);
 le_value!(f64);
 
+// `NonZero*` is encoded as the primitive it wraps, and orders the same way. Zero is the one
+// encoding of that primitive it can never produce, which `Option<NonZero*>` uses for `None`.
+// `NonZeroUsize` and `NonZeroIsize` are left out, as `usize` and `isize` are: their width varies
+// between platforms.
+macro_rules! nonzero_impl {
+    ($t:ident, $prim:ty) => {
+        impl Value for $t {
+            type SelfType<'a> = $t;
+            type AsBytes<'a>
+                = [u8; size_of::<$prim>()]
+            where
+                Self: 'a;
+
+            const NICHE: Option<&'static [u8]> = Some(&[0; size_of::<$prim>()]);
+
+            fn fixed_width() -> Option<usize> {
+                Some(size_of::<$prim>())
+            }
+
+            fn from_bytes<'a>(data: &'a [u8]) -> $t
+            where
+                Self: 'a,
+            {
+                // Only `as_bytes()` output is decoded, and that is never zero
+                <$t>::new(<$prim>::from_le_bytes(data.try_into().unwrap())).unwrap()
+            }
+
+            fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> [u8; size_of::<$prim>()]
+            where
+                Self: 'a,
+                Self: 'b,
+            {
+                value.get().to_le_bytes()
+            }
+
+            fn type_name() -> TypeName {
+                TypeName::internal(stringify!($t))
+            }
+        }
+
+        impl Key for $t {
+            fn compare(data1: &[u8], data2: &[u8]) -> Ordering {
+                Self::from_bytes(data1).cmp(&Self::from_bytes(data2))
+            }
+        }
+    };
+}
+
+nonzero_impl!(NonZeroU8, u8);
+nonzero_impl!(NonZeroU16, u16);
+nonzero_impl!(NonZeroU32, u32);
+nonzero_impl!(NonZeroU64, u64);
+nonzero_impl!(NonZeroU128, u128);
+nonzero_impl!(NonZeroI8, i8);
+nonzero_impl!(NonZeroI16, i16);
+nonzero_impl!(NonZeroI32, i32);
+nonzero_impl!(NonZeroI64, i64);
+nonzero_impl!(NonZeroI128, i128);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1062,6 +1191,153 @@ mod tests {
         let left = <Option<u64> as Value>::as_bytes(&Some(1));
         let right = <Option<u64> as Value>::as_bytes(&Some(2));
         assert_eq!(<Option<u64> as Key>::separator(&left, &right), left);
+        // ...whether it is encoded with a tag or with a niche
+        let left = <Option<NonZeroU64> as Value>::as_bytes(&NonZeroU64::new(1));
+        let right = <Option<NonZeroU64> as Value>::as_bytes(&NonZeroU64::new(2));
+        assert_eq!(<Option<NonZeroU64> as Key>::separator(&left, &right), left);
+    }
+
+    // `NonZeroU32` never encodes as zero, so `Option<NonZeroU32>` uses that for `None` and stays
+    // as wide as `NonZeroU32`, where `Option<u32>` needs a tag byte
+    #[test]
+    fn option_of_niche_type_drops_the_tag() {
+        assert_eq!(<NonZeroU32 as Value>::NICHE, Some([0; 4].as_slice()));
+        assert_eq!(<NonZeroU32 as Value>::fixed_width(), Some(4));
+        assert_eq!(<Option<NonZeroU32> as Value>::fixed_width(), Some(4));
+        assert_eq!(<Option<u32> as Value>::fixed_width(), Some(5));
+
+        assert_eq!(<Option<NonZeroU32> as Value>::as_bytes(&None), [0; 4]);
+        assert_eq!(
+            <Option<NonZeroU32> as Value>::as_bytes(&NonZeroU32::new(1)),
+            [1, 0, 0, 0]
+        );
+        for value in [None, NonZeroU32::new(1), NonZeroU32::new(u32::MAX)] {
+            let encoded = <Option<NonZeroU32> as Value>::as_bytes(&value);
+            assert_eq!(<Option<NonZeroU32> as Value>::from_bytes(&encoded), value);
+        }
+
+        // `None` sorts below every `Some`, as it does with a tag, including a negative one
+        let none = <Option<NonZeroI32> as Value>::as_bytes(&None);
+        let min = <Option<NonZeroI32> as Value>::as_bytes(&NonZeroI32::new(i32::MIN));
+        let one = <Option<NonZeroI32> as Value>::as_bytes(&NonZeroI32::new(1));
+        assert!(<Option<NonZeroI32> as Key>::compare(&none, &none).is_eq());
+        assert!(<Option<NonZeroI32> as Key>::compare(&none, &min).is_lt());
+        assert!(<Option<NonZeroI32> as Key>::compare(&min, &none).is_gt());
+        assert!(<Option<NonZeroI32> as Key>::compare(&min, &one).is_lt());
+
+        // Composites see the same width: a `Vec` stores no element lengths, and an outer
+        // `Option` needs a tag, since `Option` declares no niche of its own
+        assert_eq!(
+            <Vec<Option<NonZeroU32>> as Value>::as_bytes(&vec![None, NonZeroU32::new(1)]),
+            [2, 0, 0, 0, 0, 1, 0, 0, 0]
+        );
+        assert_eq!(
+            <Option<Option<NonZeroU32>> as Value>::fixed_width(),
+            Some(5)
+        );
+    }
+
+    // Types that declare no niche keep the tag, so their existing tables stay readable
+    #[test]
+    fn option_of_type_without_niche_keeps_the_tag() {
+        assert_eq!(<u32 as Value>::NICHE, None);
+        assert_eq!(<&str as Value>::NICHE, None);
+        assert_eq!(<Option<u32> as Value>::as_bytes(&None), [0; 5]);
+        assert_eq!(<Option<u32> as Value>::as_bytes(&Some(1)), [1, 1, 0, 0, 0]);
+        assert_eq!(<Option<&str> as Value>::as_bytes(&None), [0]);
+        assert_eq!(<Option<&str> as Value>::as_bytes(&Some("a")), [1, b'a']);
+    }
+
+    // A variable width key type with a niche: UTF-8 never contains the byte `0xff`
+    #[derive(Debug)]
+    struct NicheStr;
+
+    impl Value for NicheStr {
+        type SelfType<'a> = &'a str;
+        type AsBytes<'a>
+            = &'a [u8]
+        where
+            Self: 'a;
+
+        const NICHE: Option<&'static [u8]> = Some(&[0xff]);
+
+        fn fixed_width() -> Option<usize> {
+            None
+        }
+
+        fn from_bytes<'a>(data: &'a [u8]) -> &'a str
+        where
+            Self: 'a,
+        {
+            core::str::from_utf8(data).unwrap()
+        }
+
+        fn as_bytes<'a, 'b: 'a>(value: &'a &'b str) -> &'a [u8]
+        where
+            Self: 'b,
+        {
+            value.as_bytes()
+        }
+
+        fn type_name() -> TypeName {
+            TypeName::new("test::NicheStr")
+        }
+    }
+
+    impl Key for NicheStr {
+        fn compare(data1: &[u8], data2: &[u8]) -> Ordering {
+            <&str as Key>::compare(data1, data2)
+        }
+
+        fn separator<'a>(left: &'a [u8], right: &'a [u8]) -> Cow<'a, [u8]> {
+            <&str as Key>::separator(left, right)
+        }
+
+        fn min_encoded_key() -> Option<Cow<'static, [u8]>> {
+            <&str as Key>::min_encoded_key()
+        }
+    }
+
+    // A variable width `Option` with a niche encodes `None` as the niche, whatever its length,
+    // and a `Some` exactly as `T`
+    #[test]
+    fn variable_width_option_niche() {
+        type Opt = Option<NicheStr>;
+        assert_eq!(<Opt as Value>::fixed_width(), None);
+        assert_eq!(<Opt as Value>::as_bytes(&None), [0xff]);
+        assert_eq!(<Opt as Value>::as_bytes(&Some("abc")), b"abc");
+        // The empty string is a `Some`, distinct from `None`
+        assert_eq!(<Opt as Value>::as_bytes(&Some("")), b"");
+        for value in [None, Some(""), Some("abc")] {
+            let encoded = <Opt as Value>::as_bytes(&value);
+            assert_eq!(<Opt as Value>::from_bytes(&encoded), value);
+        }
+
+        let none = <Opt as Value>::as_bytes(&None);
+        let empty = <Opt as Value>::as_bytes(&Some(""));
+        let abc = <Opt as Value>::as_bytes(&Some("abc"));
+        assert!(<Opt as Key>::compare(&none, &none).is_eq());
+        assert!(<Opt as Key>::compare(&none, &empty).is_lt());
+        assert!(<Opt as Key>::compare(&empty, &none).is_gt());
+        assert!(<Opt as Key>::compare(&empty, &abc).is_lt());
+
+        // (left, right, the shortest separator)
+        let cases: &[(Option<&str>, Option<&str>, &[u8])] = &[
+            // The payloads separate as `&str` does, with no tag in front of them
+            (Some("abc0suffix"), Some("abc1suffix"), b"abc1"),
+            // `None` keeps its encoding
+            (None, Some("abc"), b"\xff"),
+            // Nothing shorter than `left` sorts above it
+            (Some("abc"), Some("abd-suffix"), b"abc"),
+        ];
+        for &(left, right, expected) in cases {
+            let left = <Opt as Value>::as_bytes(&left);
+            let right = <Opt as Value>::as_bytes(&right);
+            let separator = <Opt as Key>::separator(&left, &right);
+            assert_eq!(separator, expected);
+            assert!(<Opt as Key>::compare(&left, &separator).is_le());
+            assert!(<Opt as Key>::compare(&separator, &right).is_lt());
+        }
     }
 
     #[test]
@@ -1244,6 +1520,15 @@ mod tests {
             <Option<u64> as Key>::min_encoded_key().as_deref(),
             Some([0; 9].as_slice())
         );
+        // A niche is what `None` encodes to, so it is the smallest encoding of that `Option`
+        assert_eq!(
+            <Option<NonZeroU32> as Key>::min_encoded_key().as_deref(),
+            Some([0; 4].as_slice())
+        );
+        assert_eq!(
+            <Option<NicheStr> as Key>::min_encoded_key().as_deref(),
+            Some([0xff].as_slice())
+        );
         // A one element tuple is encoded exactly as its element
         assert_eq!(
             <(&str,) as Key>::min_encoded_key().as_deref(),
@@ -1263,6 +1548,10 @@ mod tests {
         assert_least::<Option<&str>>(&None);
         assert_least::<Option<u64>>(&Some(1));
         assert_least::<Option<u64>>(&None);
+        assert_least::<Option<NonZeroI32>>(&NonZeroI32::new(i32::MIN));
+        assert_least::<Option<NonZeroI32>>(&None);
+        assert_least::<Option<NicheStr>>(&Some(""));
+        assert_least::<Option<NicheStr>>(&None);
     }
 
     #[test]
@@ -1318,6 +1607,7 @@ mod tests {
         }
 
         assert_internal3(<Option<u32> as Value>::type_name());
+        assert_internal3(<Option<NonZeroU32> as Value>::type_name());
         assert_internal3(<Vec<u32> as Value>::type_name());
         assert_internal3(<[u32; 3] as Value>::type_name());
         assert_internal3(<&[u8; 3] as Value>::type_name());

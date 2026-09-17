@@ -63,6 +63,16 @@
   all built-in types are unaffected.
 
 ## 4.4.0 - 2026-XX-XX
+### New features
+* Implement `Value` and `Key` for the `NonZero` integer types, `NonZeroU8` to `NonZeroU128` and
+  `NonZeroI8` to `NonZeroI128`. They are encoded as the primitives they wrap, and an `Option` of
+  one is the same width as the bare type, with zero encoding `None`.
+* Add `Value::NICHE`, an optional byte string that a type never encodes to. When a type declares
+  one, `Option` of that type encodes `None` as it, in place of a tag byte. Declaring a niche for a
+  type that is already stored inside an `Option` changes that encoding, so its existing tables
+  would no longer be readable.
+
+### Bug fixes
 * Fix a bug where `check_integrity()` could report that it repaired corruption, after a transaction
   that grew the file size was aborted.
 

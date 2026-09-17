@@ -462,6 +462,9 @@ impl<T: Value> Value for (T,) {
     where
         Self: 'a;
 
+    // Encoded exactly as `T`, so `T`'s niche is its niche too
+    const NICHE: Option<&'static [u8]> = T::NICHE;
+
     fn fixed_width() -> Option<usize> {
         T::fixed_width()
     }
@@ -619,6 +622,7 @@ mod test {
     use alloc::borrow::Cow;
     use alloc::format;
     use core::cmp::Ordering;
+    use core::num::{NonZeroU32, NonZeroU64};
 
     #[test]
     fn width() {
@@ -663,6 +667,28 @@ mod test {
     fn single_element_tuple_separator() {
         // Encoded exactly as the element, so it separates the same way
         check_separator::<(&str,)>(&("abc0suffix",), &("abc1suffix",), &("abc1",));
+    }
+
+    #[test]
+    fn single_element_tuple_forwards_niche() {
+        // Encoded exactly as its element, so its element's niche is its niche too
+        assert_eq!(
+            <(NonZeroU32,) as Value>::NICHE,
+            <NonZeroU32 as Value>::NICHE
+        );
+        assert_eq!(<Option<(NonZeroU32,)> as Value>::fixed_width(), Some(4));
+        assert_eq!(<Option<(NonZeroU32,)> as Value>::as_bytes(&None), [0; 4]);
+        assert_eq!(
+            <Option<(NonZeroU32,)> as Value>::as_bytes(&Some((NonZeroU32::new(1).unwrap(),))),
+            [1, 0, 0, 0]
+        );
+        assert_eq!(<Option<(NonZeroU32,)> as Value>::from_bytes(&[0; 4]), None);
+        // Longer tuples declare none, so an `Option` of one keeps its tag
+        assert_eq!(<(NonZeroU32, NonZeroU32) as Value>::NICHE, None);
+        assert_eq!(
+            <Option<(NonZeroU32, NonZeroU32)> as Value>::fixed_width(),
+            Some(9)
+        );
     }
 
     #[test]
@@ -741,6 +767,12 @@ mod test {
         check_separator::<(&str, Option<u64>)>(
             &("abc0suffix", Some(7)),
             &("abc1suffix", Some(9)),
+            &("abc1", None),
+        );
+        // ...and so does one whose `None` is encoded as a niche
+        check_separator::<(&str, Option<NonZeroU64>)>(
+            &("abc0suffix", NonZeroU64::new(7)),
+            &("abc1suffix", NonZeroU64::new(9)),
             &("abc1", None),
         );
     }
